@@ -87,3 +87,7 @@ loginctl disable-linger "$USER"   # only if no other user services need it
 
 - [ ] Send the new password / QR code to an ESP with an e-ink display
   (`guest-wifi.json` already contains `ssid`, `password` and the QR `payload`)
+
+## License
+
+MIT, see [LICENSE](LICENSE).
