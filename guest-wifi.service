@@ -9,10 +9,11 @@ StartLimitBurst=5
 [Service]
 Type=oneshot
 # Output files go to ~/.local/state/guest-wifi, created by systemd
+# (no ~/.config/guest-wifi directory: systemd would symlink the state directory to it)
 StateDirectory=guest-wifi
 StateDirectoryMode=0700
 WorkingDirectory=%S/guest-wifi
-EnvironmentFile=%E/guest-wifi/env
+EnvironmentFile=%E/guest-wifi.env
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 ExecStart=%h/.local/bin/guest_wifi.py --index 3
 # Keep the new password out of the journal; errors (stderr) stay visible.

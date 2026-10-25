@@ -32,12 +32,15 @@ Pass the matching index with `--index` (often 3).
 `list_wlans.py` lists the SSIDs of all `WLANConfiguration` services without changing anything.
 With `--index`, set `FRITZ_GUEST_SSID` (or `--ssid`) as well, so a wrong index cannot change the main Wi-Fi.
 
+`show_qr.py` shows the current QR code, SSID and password in the terminal
+(reads `~/.local/state/guest-wifi/guest-wifi.json`, or the file given as argument).
+
 ## Weekly via systemd (user unit)
 
 ```sh
 install -Dm 755 guest_wifi.py ~/.local/bin/guest_wifi.py
 install -Dm 644 -t ~/.config/systemd/user/ guest-wifi.service guest-wifi.timer
-install -Dm 600 guest-wifi.env.example ~/.config/guest-wifi/env   # fill in the values
+install -Dm 600 guest-wifi.env.example ~/.config/guest-wifi.env   # fill in the values
 systemctl --user daemon-reload
 systemctl --user enable --now guest-wifi.timer
 loginctl enable-linger "$USER"   # run the timer without a logged-in session
@@ -78,7 +81,7 @@ systemctl --user daemon-reload
 ```sh
 systemctl --user disable --now guest-wifi.timer
 rm ~/.local/bin/guest_wifi.py ~/.config/systemd/user/guest-wifi.{service,timer}
-rm -r ~/.config/guest-wifi ~/.local/state/guest-wifi
+rm -r ~/.config/guest-wifi.env ~/.local/state/guest-wifi
 systemctl --user daemon-reload
 loginctl disable-linger "$USER"   # only if no other user services need it
 ```
