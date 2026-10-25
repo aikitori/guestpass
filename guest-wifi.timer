@@ -1,0 +1,9 @@
+[Unit]
+Description=Renew the guest Wi-Fi password weekly
+
+[Timer]
+OnCalendar=Wed *-*-* 04:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

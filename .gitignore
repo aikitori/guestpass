@@ -1,0 +1,9 @@
+# Contain the current guest Wi-Fi password
+guest-wifi.json
+guest-wifi-qr.png
+
+# Credentials
+/env
+*.env
+
+__pycache__/
