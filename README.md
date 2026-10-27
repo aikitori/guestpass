@@ -2,7 +2,7 @@
 
 Sets a new random password for the guest Wi-Fi of a FRITZ!Box via TR-064.
 It then creates a Wi-Fi QR code (PNG and ASCII in the terminal) and a JSON file with the
-SSID, the password and the QR payload, for example for a display on an ESP.
+SSID, the password and the QR payload, which `send_to_display.py` sends to an e-paper display (see below).
 
 ## Requirements
 
@@ -68,10 +68,10 @@ If it fails, `journalctl --user -u guest-wifi.service` shows the error.
 
 ### Update
 
-After changing the script or the units, install them again and reload systemd:
+After changing the scripts or the units, install them again and reload systemd:
 
 ```sh
-install -Dm 755 guest_wifi.py ~/.local/bin/guest_wifi.py
+install -Dm 755 -t ~/.local/bin/ guest_wifi.py send_to_display.py
 install -Dm 644 -t ~/.config/systemd/user/ guest-wifi.service guest-wifi.timer
 systemctl --user daemon-reload
 ```
@@ -80,16 +80,60 @@ systemctl --user daemon-reload
 
 ```sh
 systemctl --user disable --now guest-wifi.timer
-rm ~/.local/bin/guest_wifi.py ~/.config/systemd/user/guest-wifi.{service,timer}
+rm ~/.local/bin/{guest_wifi,send_to_display}.py ~/.config/systemd/user/guest-wifi.{service,timer}
 rm -r ~/.config/guest-wifi.env ~/.local/state/guest-wifi
 systemctl --user daemon-reload
 loginctl disable-linger "$USER"   # only if no other user services need it
 ```
 
-## To do
+## E-paper display
 
-- [ ] Send the new password / QR code to an ESP with an e-ink display
-  (`guest-wifi.json` already contains `ssid`, `password` and the QR `payload`)
+`firmware/` is a PlatformIO project for the
+[CrowPanel ESP32 4.2" E-Paper](https://www.elecrow.com/wiki/CrowPanel_ESP32_E-Paper_4.2-inch_HMI_Display.html)
+(400×300, ESP32-S3). It joins the home Wi-Fi, shows the QR code, SSID and password,
+and receives new data via HTTP. The last data is kept in flash and drawn again after a restart.
+Once a day the panel is refreshed (white, then the image again) so it does not burn in.
+
+The panel driver is written for PCB **V1.2A (green round sticker on the back)**.
+The older revision has another display controller and needs another driver.
+
+### Flash the firmware
+
+```sh
+cp firmware/include/secrets.h.example firmware/include/secrets.h   # fill in the values
+cd firmware && pio run -t upload && pio device monitor
+```
+
+The serial monitor shows the address once the display is in the Wi-Fi
+(`http://guest-display.fritz.box/`). Until it gets data, the display shows the same.
+
+### Send the data
+
+Add `DISPLAY_URL` and `DISPLAY_TOKEN` to `~/.config/guest-wifi.env` (see `guest-wifi.env.example`)
+and install `send_to_display.py` next to `guest_wifi.py`:
+
+```sh
+install -Dm 755 send_to_display.py ~/.local/bin/send_to_display.py
+```
+
+After each password change, `guest_wifi.py` sends the new data to the display
+(`--display-retries N` attempts one minute apart, the service uses 10).
+A failed update does not fail the run, so systemd does not change the password again.
+To send the current data by hand, without changing the password:
+
+```sh
+set -a; . ~/.config/guest-wifi.env; set +a
+./send_to_display.py
+```
+
+### Back to the factory firmware
+
+A full flash dump was made before the first upload (8 MB, read at 460800 baud, the CH340 fails at 921600):
+
+```sh
+uvx esptool --port /dev/ttyUSB0 --baud 460800 read-flash 0 0x800000 backup.bin    # backup
+uvx esptool --port /dev/ttyUSB0 --baud 460800 write-flash 0 backup.bin            # restore
+```
 
 ## License
 

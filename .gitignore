@@ -7,3 +7,7 @@ guest-wifi-qr.png
 *.env
 
 __pycache__/
+
+# Firmware: Wi-Fi credentials and build output
+firmware/include/secrets.h
+firmware/.pio/
