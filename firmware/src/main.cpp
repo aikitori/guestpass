@@ -5,6 +5,7 @@
 // GET  /            status (without the password)
 //
 // The last data is kept in NVS and drawn again after a restart and once a day.
+// The MENU button turns the content by 180 degrees (also kept in NVS).
 #include <Adafruit_GFX.h>
 #include <ArduinoJson.h>
 #include <Preferences.h>
@@ -19,6 +20,7 @@
 constexpr uint16_t BLACK = 0;
 constexpr uint16_t WHITE = 1;
 constexpr int MARGIN = 12;
+constexpr int PIN_MENU = 2;  // MENU button, low while pressed
 
 struct GuestWifi {
   String ssid, password, payload;
@@ -30,6 +32,7 @@ WebServer server(80);
 Preferences prefs;
 GuestWifi current;
 bool waitingScreenShown = false;
+bool rotated = false;  // content turned by 180 degrees
 
 // Draws text in a column, breaking lines at spaces and after hyphens (or within a word that is
 // too long). Returns the baseline of the last line.
@@ -157,6 +160,7 @@ bool renderWaiting() {
 void load() {
   prefs.begin("guestwifi", true);
   current = {prefs.getString("ssid"), prefs.getString("password"), prefs.getString("payload")};
+  rotated = prefs.getBool("rotated", false);
   prefs.end();
 }
 
@@ -166,6 +170,20 @@ void save(const GuestWifi &w) {
   prefs.putString("password", w.password);
   prefs.putString("payload", w.payload);
   prefs.end();
+}
+
+void toggleRotation() {
+  rotated = !rotated;
+  canvas.setRotation(rotated ? 2 : 0);
+  prefs.begin("guestwifi", false);
+  prefs.putBool("rotated", rotated);
+  prefs.end();
+  Serial.printf("Rotation %s\n", rotated ? "180 degrees" : "off");
+  if (!current.ssid.isEmpty()) {
+    render(current);
+  } else if (waitingScreenShown) {
+    renderWaiting();
+  }
 }
 
 void handleUpdate() {
@@ -210,8 +228,11 @@ void setup() {
   u8g2.setForegroundColor(BLACK);
   u8g2.setBackgroundColor(WHITE);
 
+  pinMode(PIN_MENU, INPUT_PULLUP);
+
   // Draw the stored data right away, without waiting for Wi-Fi
   load();
+  canvas.setRotation(rotated ? 2 : 0);
   if (!current.ssid.isEmpty()) render(current);
 
   WiFi.persistent(false);
@@ -234,6 +255,15 @@ void loop() {
   static bool wasConnected = false;
   static uint32_t lastAttempt = 0;
   static uint32_t lastRefresh = 0;
+  static bool menuWasPressed = false;
+  static uint32_t lastMenuChange = 0;
+  // Debounced: a change counts only 50 ms after the last one
+  bool menuPressed = digitalRead(PIN_MENU) == LOW;
+  if (menuPressed != menuWasPressed && millis() - lastMenuChange > 50) {
+    lastMenuChange = millis();
+    menuWasPressed = menuPressed;
+    if (menuPressed) toggleRotation();
+  }
   // Once a day: white, then the image again, so the panel does not burn in
   if (!current.ssid.isEmpty() && millis() - lastRefresh > 24UL * 60 * 60 * 1000) {
     lastRefresh = millis();
