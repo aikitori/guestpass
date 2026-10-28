@@ -93,6 +93,8 @@ loginctl disable-linger "$USER"   # only if no other user services need it
 (400×300, ESP32-S3). It joins the home Wi-Fi, shows the QR code, SSID and password,
 and gets new data from an MQTT broker (retained message). The last data is kept in flash and drawn again after a restart.
 Once a day the panel is refreshed (white, then the image again) so it does not burn in.
+Pressing the rotary switch turns the content by 180 degrees, for example when the display stands
+upside down; the setting is kept in flash as well.
 
 The panel driver is written for PCB **V1.2A (green round sticker on the back)**.
 The older revision has another display controller and needs another driver.
