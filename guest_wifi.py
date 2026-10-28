@@ -3,6 +3,7 @@
 # requires-python = ">=3.12"
 # dependencies = [
 #     "fritzconnection",
+#     "paho-mqtt>=2",
 #     "qrcode[pil]",
 # ]
 # ///
@@ -17,11 +18,11 @@ Optional:      --password "MyPassword"       (random, 16 characters otherwise)
                --address 192.168.178.1       (or set FRITZ_ADDRESS)
                --json-file guest-wifi.json   (output for the ESP, see below)
                --qr-file guest-wifi-qr.png
-               --display-retries 10          (attempts if the display is not reachable)
+               --mqtt-retries 10             (attempts if the MQTT broker is not reachable)
 
-The JSON file contains ssid, password and payload (the WIFI: string for the
-QR code). If DISPLAY_URL and DISPLAY_TOKEN are set, the data is then sent to the
-e-paper display (send_to_display.py, installed next to this script).
+The JSON file contains ssid, password, payload (the WIFI: string for the
+QR code) and updated. If MQTT_HOST is set, the data is then published for the
+e-paper display (publish_mqtt.py, installed next to this script).
 """
 import argparse
 import json
@@ -29,6 +30,7 @@ import os
 import secrets
 import string
 import sys
+from datetime import datetime
 
 import qrcode
 from fritzconnection import FritzConnection
@@ -82,7 +84,7 @@ def main():
     p.add_argument("--ssid", default=os.environ.get("FRITZ_GUEST_SSID"))
     p.add_argument("--json-file", default="guest-wifi.json")
     p.add_argument("--qr-file", default="guest-wifi-qr.png")
-    p.add_argument("--display-retries", type=int, default=1)
+    p.add_argument("--mqtt-retries", type=int, default=1)
     a = p.parse_args()
 
     user = os.environ.get("FRITZ_USER")
@@ -126,23 +128,23 @@ def main():
     print(f"Guest Wi-Fi '{ssid}' now has the password: {new}")
     print(f"QR code saved: {wifi_qr(ssid, new, a.qr_file)}")
 
-    data = {"ssid": ssid, "password": new, "payload": wifi_payload(ssid, new)}
+    data = {
+        "ssid": ssid, "password": new, "payload": wifi_payload(ssid, new),
+        "updated": datetime.now().astimezone().isoformat(timespec="minutes"),
+    }
     with open(a.json_file, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
     os.chmod(a.json_file, 0o600)
     print(f"JSON saved: {a.json_file}")
 
-    if os.environ.get("DISPLAY_URL"):
+    if os.environ.get("MQTT_HOST"):
         # Never fail because of the display: systemd would run the script again and
-        # change the password once more. send_to_display.py can resend by hand.
+        # change the password once more. publish_mqtt.py can resend by hand.
         try:
-            import send_to_display
-            result = send_to_display.push(
-                data, os.environ["DISPLAY_URL"], os.environ.get("DISPLAY_TOKEN", ""), a.display_retries
-            )
-            print(f"Display: {result}")
+            import publish_mqtt
+            print(f"MQTT: {publish_mqtt.push(data, os.environ['MQTT_HOST'], a.mqtt_retries)}")
         except Exception as e:
-            print(f"Display not updated: {e}", file=sys.stderr)
+            print(f"MQTT: not published: {e}", file=sys.stderr)
 
 
 if __name__ == "__main__":

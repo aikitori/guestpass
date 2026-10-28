@@ -1,17 +1,21 @@
-// Guest Wi-Fi display: receives SSID, password and QR payload via HTTP and shows them on the e-paper.
+// Guest Wi-Fi display: gets SSID, password and QR payload via MQTT and shows them on the e-paper.
 //
-// POST /guest-wifi  with  Authorization: Bearer <DISPLAY_TOKEN>
-//                         {"ssid": "...", "password": "...", "payload": "WIFI:..."}
-// GET  /            status (without the password)
+// Subscribes to MQTT_TOPIC (retained, published by publish_mqtt.py):
+//   {"ssid": "...", "password": "...", "payload": "WIFI:...", "updated": "..."}
+// Publishes its state to MQTT_STATUS_TOPIC (retained, without the password).
 //
 // The last data is kept in NVS and drawn again after a restart and once a day.
+// Rotary switch: turn for the debug screens, press to rotate the image by 180 degrees.
+// EXIT or HOME: back to the guest Wi-Fi.
 #include <Adafruit_GFX.h>
 #include <ArduinoJson.h>
 #include <Preferences.h>
+#include <PubSubClient.h>
 #include <U8g2_for_Adafruit_GFX.h>
-#include <WebServer.h>
 #include <WiFi.h>
+#include <esp_system.h>
 #include <qrcode.h>
+#include <time.h>
 
 #include "epd.h"
 #include "secrets.h"
@@ -20,16 +24,42 @@ constexpr uint16_t BLACK = 0;
 constexpr uint16_t WHITE = 1;
 constexpr int MARGIN = 12;
 
+// Keys, active low
+constexpr int KEY_EXIT = 1;
+constexpr int KEY_HOME = 2;
+constexpr int KEY_DOWN = 4;
+constexpr int KEY_OK = 5;
+constexpr int KEY_UP = 6;
+
+constexpr int DEBUG_PAGES = 2;
+constexpr uint32_t DEBUG_TIMEOUT = 2 * 60 * 1000;
+constexpr int LOG_SIZE = 14;
+
 struct GuestWifi {
-  String ssid, password, payload;
+  String ssid, password, payload, updated;
+};
+
+struct Event {
+  time_t time;
+  uint32_t uptime;
+  String text;
 };
 
 GFXcanvas1 canvas(epd::WIDTH, epd::HEIGHT);
 U8G2_FOR_ADAFRUIT_GFX u8g2;
-WebServer server(80);
+WiFiClient net;
+PubSubClient mqtt(net);
 Preferences prefs;
 GuestWifi current;
 bool waitingScreenShown = false;
+bool flipped = false;  // image rotated by 180 degrees, kept in NVS
+int debugPage = -1;  // -1: the guest Wi-Fi screen
+uint32_t debugSince = 0;
+Event events[LOG_SIZE];  // newest first
+int eventCount = 0;
+Event lastMessage = {0, 0, ""};
+int wifiDrops = 0, mqttDrops = 0;
+volatile int disconnectReason = -1;  // set by the Wi-Fi event task, logged in loop()
 
 // Draws text in a column, breaking lines at spaces and after hyphens (or within a word that is
 // too long). Returns the baseline of the last line.
@@ -143,20 +173,107 @@ bool render(const GuestWifi &w) {
   return epd::show(canvas.getBuffer());
 }
 
+
 bool renderWaiting() {
   canvas.fillScreen(WHITE);
   u8g2.setFont(u8g2_font_helvB18_tf);
   u8g2.drawUTF8(MARGIN, 32, "Gäste-WLAN");
   u8g2.setFont(u8g2_font_helvR12_tf);
-  String info = "Warte auf Daten von send_to_display.py an http://" + String(HOSTNAME) + "/ (" +
-                WiFi.localIP().toString() + ")";
+  String info = "Warte auf Daten über MQTT (" MQTT_TOPIC " auf " MQTT_HOST "). Drehrad drehen: Debug-Anzeige";
   drawWrapped(info, MARGIN, 70, epd::WIDTH - 2 * MARGIN, 18);
+  return epd::show(canvas.getBuffer());
+}
+
+bool showCurrent() {
+  return current.ssid.isEmpty() ? renderWaiting() : render(current);
+}
+
+bool validTime(time_t t) { return t > 1700000000; }
+
+String duration(uint32_t s) {
+  char buf[24];
+  snprintf(buf, sizeof buf, "%lu d %02lu:%02lu:%02lu", s / 86400, s / 3600 % 24, s / 60 % 60, s % 60);
+  return buf;
+}
+
+// Wall clock if NTP has synced, uptime otherwise
+String eventTime(const Event &e) {
+  if (!validTime(e.time)) return "+" + duration(e.uptime);
+  struct tm tm;
+  localtime_r(&e.time, &tm);
+  char buf[20];
+  strftime(buf, sizeof buf, "%d.%m. %H:%M:%S", &tm);
+  return buf;
+}
+
+void logEvent(const String &text) {
+  Serial.println(text);
+  for (int i = LOG_SIZE - 1; i > 0; i--) events[i] = events[i - 1];
+  events[0] = {time(nullptr), millis() / 1000, text};
+  if (eventCount < LOG_SIZE) eventCount++;
+}
+
+String resetReason() {
+  switch (esp_reset_reason()) {
+    case ESP_RST_POWERON: return "Einschalten";
+    case ESP_RST_SW: return "Software";
+    case ESP_RST_PANIC: return "Absturz";
+    case ESP_RST_INT_WDT:
+    case ESP_RST_TASK_WDT:
+    case ESP_RST_WDT: return "Watchdog";
+    case ESP_RST_BROWNOUT: return "Unterspannung";
+    case ESP_RST_EXT: return "Reset-Taste";
+    default: return "Code " + String(esp_reset_reason());
+  }
+}
+
+bool renderDebug(int page) {
+  canvas.fillScreen(WHITE);
+  u8g2.setFont(u8g2_font_helvB14_tf);
+  u8g2.drawUTF8(MARGIN, 24, page == 0 ? "Debug: Status" : "Debug: Ereignisse");
+  String pageNo = String(page + 1) + "/" + String(DEBUG_PAGES);
+  u8g2.drawUTF8(epd::WIDTH - MARGIN - u8g2.getUTF8Width(pageNo.c_str()), 24, pageNo.c_str());
+
+  u8g2.setFont(u8g2_font_helvR10_tf);
+  int y = 48;
+  auto line = [&](const String &label, const String &value, int col) {
+    u8g2.drawUTF8(MARGIN, y, label.c_str());
+    u8g2.drawUTF8(MARGIN + col, y, value.c_str());
+    y += 16;
+  };
+  if (page == 0) {
+    const int col = 120;
+    bool wifi = WiFi.status() == WL_CONNECTED;
+    Event now = {time(nullptr), millis() / 1000, ""};
+    line("Firmware", __DATE__ " " __TIME__, col);
+    line("Laufzeit", duration(now.uptime), col);
+    line("Letzter Neustart", resetReason(), col);
+    line("Uhrzeit", validTime(now.time) ? eventTime(now) : "noch keine (NTP)", col);
+    line("WLAN", wifi ? WiFi.SSID() + ", " + String(WiFi.RSSI()) + " dBm" : "nicht verbunden", col);
+    line("IP", wifi ? WiFi.localIP().toString() : "-", col);
+    line("MAC", WiFi.macAddress(), col);
+    line("MQTT", String(MQTT_HOST) + ":" + String(MQTT_PORT) +
+                     (mqtt.connected() ? ", verbunden" : ", Fehler " + String(mqtt.state())), col);
+    line("Topic", MQTT_TOPIC, col);
+    line("Letzte Nachricht", lastMessage.uptime ? eventTime(lastMessage) : "noch keine", col);
+    line("Gäste-SSID", current.ssid.isEmpty() ? "(keine)" : current.ssid, col);
+    line("Stand der Daten", current.updated.isEmpty() ? "-" : current.updated, col);
+    line("Abbrüche", String(wifiDrops) + " WLAN, " + String(mqttDrops) + " MQTT", col);
+  } else {
+    for (int i = 0; i < eventCount; i++) line(eventTime(events[i]), events[i].text, 120);
+    if (eventCount == 0) line("Noch keine Ereignisse", "", 0);
+  }
+
+  canvas.drawFastHLine(MARGIN, 274, epd::WIDTH - 2 * MARGIN, BLACK);
+  u8g2.drawUTF8(MARGIN, 292, "Drehen: blättern   Drücken: 180° drehen   EXIT: zurück");
   return epd::show(canvas.getBuffer());
 }
 
 void load() {
   prefs.begin("guestwifi", true);
-  current = {prefs.getString("ssid"), prefs.getString("password"), prefs.getString("payload")};
+  current = {prefs.getString("ssid"), prefs.getString("password"), prefs.getString("payload"),
+             prefs.getString("updated")};
+  flipped = prefs.getBool("flipped");
   prefs.end();
 }
 
@@ -165,88 +282,168 @@ void save(const GuestWifi &w) {
   prefs.putString("ssid", w.ssid);
   prefs.putString("password", w.password);
   prefs.putString("payload", w.payload);
+  prefs.putString("updated", w.updated);
   prefs.end();
 }
 
-void handleUpdate() {
-  if (server.header("Authorization") != "Bearer " DISPLAY_TOKEN) {
-    server.send(401, "text/plain", "unauthorized\n");
-    return;
-  }
+void publishStatus() {
   JsonDocument doc;
-  if (deserializeJson(doc, server.arg("plain"))) {
-    server.send(400, "text/plain", "invalid JSON\n");
+  doc["online"] = true;
+  doc["shown_ssid"] = current.ssid;
+  doc["updated"] = current.updated;
+  doc["rssi"] = WiFi.RSSI();
+  doc["ip"] = WiFi.localIP().toString();
+  doc["uptime"] = millis() / 1000;
+  doc["wifi_drops"] = wifiDrops;
+  doc["mqtt_drops"] = mqttDrops;
+  doc["firmware"] = __DATE__ " " __TIME__;
+  String out;
+  serializeJson(doc, out);
+  mqtt.publish(MQTT_STATUS_TOPIC, out.c_str(), true);
+}
+
+void onMessage(char *topic, byte *payload, unsigned int length) {
+  lastMessage = {time(nullptr), max(millis() / 1000, 1UL), ""};
+  JsonDocument doc;
+  if (deserializeJson(doc, payload, length)) {
+    logEvent("MQTT: ungültiges JSON");
     return;
   }
-  GuestWifi w = {doc["ssid"] | "", doc["password"] | "", doc["payload"] | ""};
+  GuestWifi w = {doc["ssid"] | "", doc["password"] | "", doc["payload"] | "", doc["updated"] | ""};
   if (w.ssid.isEmpty() || w.ssid.length() > 32 || w.password.length() < 8 || w.password.length() > 63 ||
       !w.payload.startsWith("WIFI:") || w.payload.length() > 200) {
-    server.send(400, "text/plain", "expected ssid, password (8-63 characters) and a WIFI: payload\n");
+    logEvent("MQTT: Daten unvollständig");
     return;
   }
   if (w.ssid == current.ssid && w.password == current.password && w.payload == current.payload) {
-    server.send(200, "text/plain", "unchanged\n");
+    if (w.updated != current.updated) {
+      current.updated = w.updated;
+      save(current);
+    }
+    logEvent("Daten unverändert");
     return;
   }
   save(w);
   current = w;
-  if (!render(w)) {
-    server.send(500, "text/plain", "saved, but the display did not finish the refresh\n");
-    return;
-  }
-  server.send(200, "text/plain", "updated\n");
+  logEvent("Neue Daten: " + w.ssid);
+  // The debug screen stays until it is closed, then the new data is drawn
+  if (debugPage < 0 && !render(w)) logEvent("Refresh nicht fertig");
+  publishStatus();
 }
 
-void handleStatus() {
-  String ssid = current.ssid.isEmpty() ? "(none)" : current.ssid;
-  server.send(200, "text/plain", "guest-display, showing SSID: " + ssid + "\n");
+void connectMqtt() {
+  const char *user = strlen(MQTT_USER) ? MQTT_USER : nullptr;
+  if (!mqtt.connect(HOSTNAME, user, MQTT_PASSWORD, MQTT_STATUS_TOPIC, 0, true, "{\"online\":false}")) {
+    logEvent("MQTT-Fehler " + String(mqtt.state()));
+    return;
+  }
+  logEvent("MQTT verbunden");
+  mqtt.subscribe(MQTT_TOPIC, 1);  // the retained message arrives right away
+  publishStatus();
+}
+
+// Returns the key that was just pressed, or -1
+int pressedKey() {
+  static const int keys[] = {KEY_EXIT, KEY_HOME, KEY_DOWN, KEY_OK, KEY_UP};
+  static bool down[5];
+  static uint32_t lastChange[5];
+  for (int i = 0; i < 5; i++) {
+    bool d = digitalRead(keys[i]) == LOW;
+    if (d != down[i] && millis() - lastChange[i] > 30) {
+      down[i] = d;
+      lastChange[i] = millis();
+      if (d) return keys[i];
+    }
+  }
+  return -1;
+}
+
+void handleKey(int key) {
+  if (key == KEY_EXIT || key == KEY_HOME) {
+    if (debugPage < 0) return;
+    debugPage = -1;
+    showCurrent();
+    return;
+  }
+  if (key == KEY_OK) {
+    flipped = !flipped;
+    prefs.begin("guestwifi", false);
+    prefs.putBool("flipped", flipped);
+    prefs.end();
+    canvas.setRotation(flipped ? 2 : 0);
+    logEvent(flipped ? "Bild um 180° gedreht" : "Bild normal ausgerichtet");
+    if (debugPage < 0) {
+      showCurrent();
+      return;
+    }
+  } else if (debugPage < 0) {
+    debugPage = 0;
+  } else if (key == KEY_UP) {
+    debugPage = (debugPage + DEBUG_PAGES - 1) % DEBUG_PAGES;
+  } else if (key == KEY_DOWN) {
+    debugPage = (debugPage + 1) % DEBUG_PAGES;
+  }
+  debugSince = millis();
+  renderDebug(debugPage);
 }
 
 void setup() {
   Serial.begin(115200);
+  setCpuFrequencyMhz(80);  // the lowest clock Wi-Fi works with
+  for (int key : {KEY_EXIT, KEY_HOME, KEY_DOWN, KEY_OK, KEY_UP}) pinMode(key, INPUT_PULLUP);
   epd::begin();
   u8g2.begin(canvas);
   u8g2.setFontMode(1);
   u8g2.setForegroundColor(BLACK);
   u8g2.setBackgroundColor(WHITE);
+  logEvent("Start (" + resetReason() + ")");
 
   // Draw the stored data right away, without waiting for Wi-Fi
   load();
+  canvas.setRotation(flipped ? 2 : 0);
   if (!current.ssid.isEmpty()) render(current);
 
   WiFi.persistent(false);
   WiFi.setHostname(HOSTNAME);  // before mode(), otherwise the default name is used
   WiFi.mode(WIFI_STA);
+  // Modem sleep: the radio sleeps between beacons, MQTT stays connected
+  WiFi.setSleep(WIFI_PS_MAX_MODEM);
   WiFi.setAutoReconnect(true);
   WiFi.onEvent([](WiFiEvent_t, WiFiEventInfo_t info) {
-    Serial.printf("Wi-Fi disconnected, reason %d\n", info.wifi_sta_disconnected.reason);
+    disconnectReason = info.wifi_sta_disconnected.reason;
   }, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  configTzTime("CET-1CEST,M3.5.0,M10.5.0/3", "fritz.box", "pool.ntp.org");
 
-  const char *headers[] = {"Authorization"};
-  server.collectHeaders(headers, 1);
-  server.on("/", HTTP_GET, handleStatus);
-  server.on("/guest-wifi", HTTP_POST, handleUpdate);
-  server.begin();
+  mqtt.setServer(MQTT_HOST, MQTT_PORT);
+  mqtt.setBufferSize(512);  // the default of 256 bytes is too small for the JSON
+  mqtt.setKeepAlive(60);
+  mqtt.setSocketTimeout(5);
+  mqtt.setCallback(onMessage);
 }
 
 void loop() {
-  static bool wasConnected = false;
-  static uint32_t lastAttempt = 0;
-  static uint32_t lastRefresh = 0;
+  static bool wasConnected = false, wasMqttConnected = false;
+  static uint32_t lastAttempt = 0, lastMqttAttempt = 0, lastRefresh = 0, lastStatus = 0;
   // Once a day: white, then the image again, so the panel does not burn in
-  if (!current.ssid.isEmpty() && millis() - lastRefresh > 24UL * 60 * 60 * 1000) {
+  if (!current.ssid.isEmpty() && debugPage < 0 && millis() - lastRefresh > 24UL * 60 * 60 * 1000) {
     lastRefresh = millis();
-    Serial.println("Daily refresh");
+    logEvent("Täglicher Refresh");
     canvas.fillScreen(WHITE);
     epd::show(canvas.getBuffer());
     render(current);
   }
+
+  if (disconnectReason >= 0) {
+    logEvent("WLAN getrennt, Grund " + String(disconnectReason));
+    disconnectReason = -1;
+  }
   bool connected = WiFi.status() == WL_CONNECTED;
   if (connected && !wasConnected) {
-    Serial.printf("Wi-Fi connected, http://%s/ (%s)\n", HOSTNAME, WiFi.localIP().toString().c_str());
-    if (current.ssid.isEmpty() && !waitingScreenShown) waitingScreenShown = renderWaiting();
+    logEvent("WLAN verbunden, " + WiFi.localIP().toString());
+    if (current.ssid.isEmpty() && !waitingScreenShown && debugPage < 0) waitingScreenShown = renderWaiting();
   }
+  if (!connected && wasConnected) wifiDrops++;
   // Auto-reconnect does not retry when the first connection fails, so start over now and then
   if (!connected && millis() - lastAttempt > 30000) {
     lastAttempt = millis();
@@ -255,6 +452,28 @@ void loop() {
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   }
   wasConnected = connected;
-  server.handleClient();
-  delay(2);
+
+  bool mqttConnected = mqtt.connected();
+  if (wasMqttConnected && !mqttConnected) {
+    mqttDrops++;
+    logEvent("MQTT getrennt");
+  }
+  if (connected && !mqttConnected && (lastMqttAttempt == 0 || millis() - lastMqttAttempt > 10000)) {
+    lastMqttAttempt = millis();
+    connectMqtt();
+  }
+  wasMqttConnected = mqtt.connected();
+  mqtt.loop();
+  if (wasMqttConnected && millis() - lastStatus > 15UL * 60 * 1000) {
+    lastStatus = millis();
+    publishStatus();
+  }
+
+  int key = pressedKey();
+  if (key >= 0) handleKey(key);
+  if (debugPage >= 0 && millis() - debugSince > DEBUG_TIMEOUT) {
+    debugPage = -1;
+    showCurrent();
+  }
+  delay(10);
 }
