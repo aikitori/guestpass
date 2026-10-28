@@ -2,7 +2,7 @@
 
 Sets a new random password for the guest Wi-Fi of a FRITZ!Box via TR-064.
 It then creates a Wi-Fi QR code (PNG and ASCII in the terminal) and a JSON file with the
-SSID, the password and the QR payload, which `send_to_display.py` sends to an e-paper display (see below).
+SSID, the password and the QR payload, which `publish_mqtt.py` publishes via MQTT for an e-paper display (see below).
 
 ## Requirements
 
@@ -71,7 +71,7 @@ If it fails, `journalctl --user -u guest-wifi.service` shows the error.
 After changing the scripts or the units, install them again and reload systemd:
 
 ```sh
-install -Dm 755 -t ~/.local/bin/ guest_wifi.py send_to_display.py
+install -Dm 755 -t ~/.local/bin/ guest_wifi.py publish_mqtt.py
 install -Dm 644 -t ~/.config/systemd/user/ guest-wifi.service guest-wifi.timer
 systemctl --user daemon-reload
 ```
@@ -80,7 +80,7 @@ systemctl --user daemon-reload
 
 ```sh
 systemctl --user disable --now guest-wifi.timer
-rm ~/.local/bin/{guest_wifi,send_to_display}.py ~/.config/systemd/user/guest-wifi.{service,timer}
+rm ~/.local/bin/{guest_wifi,publish_mqtt}.py ~/.config/systemd/user/guest-wifi.{service,timer}
 rm -r ~/.config/guest-wifi.env ~/.local/state/guest-wifi
 systemctl --user daemon-reload
 loginctl disable-linger "$USER"   # only if no other user services need it
@@ -91,7 +91,7 @@ loginctl disable-linger "$USER"   # only if no other user services need it
 `firmware/` is a PlatformIO project for the
 [CrowPanel ESP32 4.2" E-Paper](https://www.elecrow.com/wiki/CrowPanel_ESP32_E-Paper_4.2-inch_HMI_Display.html)
 (400×300, ESP32-S3). It joins the home Wi-Fi, shows the QR code, SSID and password,
-and receives new data via HTTP. The last data is kept in flash and drawn again after a restart.
+and gets new data from an MQTT broker (retained message). The last data is kept in flash and drawn again after a restart.
 Once a day the panel is refreshed (white, then the image again) so it does not burn in.
 
 The panel driver is written for PCB **V1.2A (green round sticker on the back)**.
@@ -104,27 +104,40 @@ cp firmware/include/secrets.h.example firmware/include/secrets.h   # fill in the
 cd firmware && pio run -t upload && pio device monitor
 ```
 
-The serial monitor shows the address once the display is in the Wi-Fi
-(`http://guest-display.fritz.box/`). Until it gets data, the display shows the same.
+The serial monitor shows the connection state. Until it gets data, the display says so.
+Rotary switch: turn for the debug screens (status, event log), press to rotate the image by 180°.
+EXIT or HOME: back to the guest Wi-Fi. The display also publishes its state (without the password)
+to `guestpass/display/status`.
 
-### Send the data
+### Publish the data
 
-Add `DISPLAY_URL` and `DISPLAY_TOKEN` to `~/.config/guest-wifi.env` (see `guest-wifi.env.example`)
-and install `send_to_display.py` next to `guest_wifi.py`:
+Add `MQTT_HOST` (and optionally `MQTT_PORT`, `MQTT_USER`, `MQTT_PASSWORD`, `MQTT_TOPIC`) to
+`~/.config/guest-wifi.env` (see `guest-wifi.env.example`) and install `publish_mqtt.py` next to `guest_wifi.py`:
 
 ```sh
-install -Dm 755 send_to_display.py ~/.local/bin/send_to_display.py
+install -Dm 755 publish_mqtt.py ~/.local/bin/publish_mqtt.py
 ```
 
-After each password change, `guest_wifi.py` sends the new data to the display
-(`--display-retries N` attempts one minute apart, the service uses 10).
+After each password change, `guest_wifi.py` publishes the new data as a retained message
+(`--mqtt-retries N` attempts one minute apart, the service uses 10).
 A failed update does not fail the run, so systemd does not change the password again.
-To send the current data by hand, without changing the password:
+To publish the current data by hand, without changing the password:
 
 ```sh
 set -a; . ~/.config/guest-wifi.env; set +a
-./send_to_display.py
+./publish_mqtt.py
 ```
+
+The password is stored on the broker, so give it a login and an ACL: only the publisher may write
+`guestpass/wifi`, only the display may read it and write `guestpass/display/#`. There is no TLS yet.
+
+### Battery operation
+
+By default the display stays connected (Wi-Fi modem sleep), which takes roughly 40–100 mA.
+With `#define SLEEP_INTERVAL_S 900` in `secrets.h` it sleeps instead: every 900 s it wakes up, reads the
+retained message, redraws only if it changed, publishes its status and sleeps again (about 1–3 mA on
+average, to be measured on the board). Any key wakes it up too and keeps it awake while the debug screen is
+open. A new password appears on the display after at most one interval.
 
 ### Back to the factory firmware
 

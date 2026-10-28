@@ -56,18 +56,17 @@ While it is open, new data is saved but drawn only after it closes.
 
 No home Wi-Fi password or MQTT credentials are shown.
 
-## Phase 2: deep sleep on battery (later, only if needed)
+## Phase 2: deep sleep on battery (optional, `SLEEP_INTERVAL_S` in `secrets.h`)
 
-Only worth it if the display has to run on a battery:
+Implemented as an option, off by default. The display wakes up every `SLEEP_INTERVAL_S` seconds (timer)
+and on any key (EXT1, all keys are on RTC GPIOs), connects, reads the retained message, redraws only on
+change, publishes the status (`online: false` before sleeping, since a clean disconnect sends no last will)
+and sleeps again. The panel keeps its image, so a wake-up does not redraw. The daily refresh is counted in
+RTC memory. A key wake-up handles the key and stays awake while the debug screen is open.
 
-1. Measure the deep sleep current of the board first (CH340, regulator and power LED may dominate).
-   One wake-up costs about 0.2 mAh (about 5 s at 120 mA); a sleep current of 50 µA gives about two
-   years on 1000 mAh, 2 mA only about three weeks.
-2. Wake up once a day (NTP-based, after the Wednesday timer run) and on any key (EXT1 wake-up,
-   all keys are on RTC GPIOs), fetch the retained message, redraw only on change, publish the
-   status and sleep again.
-3. Keep BSSID, channel and a static IP in RTC memory for a fast connect, and keep the event log there.
-4. Long press on HOME: maintenance mode with OTA for 10 minutes.
+Still open: measure the sleep current of the board (CH340, regulator and power LED may dominate; one
+wake-up costs about 0.2 mAh), faster connect with BSSID and channel in RTC memory, keeping the event log
+in RTC memory, OTA maintenance mode.
 
 ## Status
 
@@ -79,4 +78,5 @@ Only worth it if the display has to run on a battery:
 - [ ] Build and flash (`pio run -t upload`), fill in the MQTT values in `include/secrets.h`
 - [ ] Test: retained message after restart, unchanged data does not redraw, broker down keeps the
       image, keys and rotation, debug timeout
-- [ ] Update the README section "E-paper display"
+- [x] README section "E-paper display"
+- [x] Deep sleep option (Phase 2), build checked; sleep current not measured yet

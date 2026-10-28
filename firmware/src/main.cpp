@@ -4,6 +4,10 @@
 //   {"ssid": "...", "password": "...", "payload": "WIFI:...", "updated": "..."}
 // Publishes its state to MQTT_STATUS_TOPIC (retained, without the password).
 //
+// With SLEEP_INTERVAL_S in secrets.h the display runs on a battery: it wakes up every
+// SLEEP_INTERVAL_S seconds, reads the retained message, redraws if it changed, publishes its status
+// and goes back to deep sleep. Any key wakes it up too; it stays awake while the debug screen is open.
+//
 // The last data is kept in NVS and drawn again after a restart and once a day.
 // Rotary switch: turn for the debug screens, press to rotate the image by 180 degrees.
 // EXIT or HOME: back to the guest Wi-Fi.
@@ -13,12 +17,20 @@
 #include <PubSubClient.h>
 #include <U8g2_for_Adafruit_GFX.h>
 #include <WiFi.h>
+#include <driver/rtc_io.h>
+#include <esp_sleep.h>
 #include <esp_system.h>
 #include <qrcode.h>
 #include <time.h>
 
 #include "epd.h"
 #include "secrets.h"
+
+// Optional: seconds between two checks in battery mode, 0 keeps the display connected all the time
+#ifndef SLEEP_INTERVAL_S
+#define SLEEP_INTERVAL_S 0
+#endif
+constexpr bool SLEEP_MODE = SLEEP_INTERVAL_S > 0;
 
 constexpr uint16_t BLACK = 0;
 constexpr uint16_t WHITE = 1;
@@ -30,10 +42,13 @@ constexpr int KEY_HOME = 2;
 constexpr int KEY_DOWN = 4;
 constexpr int KEY_OK = 5;
 constexpr int KEY_UP = 6;
+constexpr int KEYS[] = {KEY_EXIT, KEY_HOME, KEY_DOWN, KEY_OK, KEY_UP};
 
 constexpr int DEBUG_PAGES = 2;
 constexpr uint32_t DEBUG_TIMEOUT = 2 * 60 * 1000;
 constexpr int LOG_SIZE = 14;
+constexpr uint32_t CYCLE_TIMEOUT = 40 * 1000;  // battery mode: give up waiting for Wi-Fi or the broker
+constexpr uint32_t IDLE_BEFORE_SLEEP = 5 * 1000;  // battery mode: stay awake this long after the last activity
 
 struct GuestWifi {
   String ssid, password, payload, updated;
@@ -59,6 +74,10 @@ Event events[LOG_SIZE];  // newest first
 int eventCount = 0;
 Event lastMessage = {0, 0, ""};
 int wifiDrops = 0, mqttDrops = 0;
+uint32_t lastActivity = 0;  // battery mode: last key press or end of the debug screen
+bool gotMessage = false;  // battery mode: the retained message has arrived
+esp_sleep_wakeup_cause_t wakeCause;
+RTC_DATA_ATTR uint32_t secondsSinceRefresh = 0;  // battery mode: survives deep sleep
 volatile int disconnectReason = -1;  // set by the Wi-Fi event task, logged in loop()
 
 // Draws text in a column, breaking lines at spaces and after hyphens (or within a word that is
@@ -286,9 +305,10 @@ void save(const GuestWifi &w) {
   prefs.end();
 }
 
-void publishStatus() {
+void publishStatus(bool online = true) {
   JsonDocument doc;
-  doc["online"] = true;
+  doc["online"] = online;
+  if (SLEEP_MODE) doc["sleep_interval"] = SLEEP_INTERVAL_S;
   doc["shown_ssid"] = current.ssid;
   doc["updated"] = current.updated;
   doc["rssi"] = WiFi.RSSI();
@@ -303,6 +323,7 @@ void publishStatus() {
 }
 
 void onMessage(char *topic, byte *payload, unsigned int length) {
+  gotMessage = true;
   lastMessage = {time(nullptr), max(millis() / 1000, 1UL), ""};
   JsonDocument doc;
   if (deserializeJson(doc, payload, length)) {
@@ -344,15 +365,14 @@ void connectMqtt() {
 
 // Returns the key that was just pressed, or -1
 int pressedKey() {
-  static const int keys[] = {KEY_EXIT, KEY_HOME, KEY_DOWN, KEY_OK, KEY_UP};
   static bool down[5];
   static uint32_t lastChange[5];
   for (int i = 0; i < 5; i++) {
-    bool d = digitalRead(keys[i]) == LOW;
+    bool d = digitalRead(KEYS[i]) == LOW;
     if (d != down[i] && millis() - lastChange[i] > 30) {
       down[i] = d;
       lastChange[i] = millis();
-      if (d) return keys[i];
+      if (d) return KEYS[i];
     }
   }
   return -1;
@@ -387,21 +407,72 @@ void handleKey(int key) {
   renderDebug(debugPage);
 }
 
+// White, then the image again, so the panel does not burn in
+void dailyRefresh() {
+  logEvent("Täglicher Refresh");
+  canvas.fillScreen(WHITE);
+  epd::show(canvas.getBuffer());
+  render(current);
+}
+
+bool anyKeyDown() {
+  for (int key : KEYS) {
+    if (digitalRead(key) == LOW) return true;
+  }
+  return false;
+}
+
+[[noreturn]] void sleepUntilNextCheck() {
+  if (mqtt.connected()) {
+    publishStatus(false);  // no last will on a clean disconnect, so say it here
+    mqtt.loop();
+    mqtt.disconnect();
+  }
+  WiFi.disconnect(true);
+  // A key that is still down would wake the display up again at once
+  while (anyKeyDown()) delay(10);
+  delay(50);
+  uint64_t mask = 0;
+  for (int key : KEYS) {
+    mask |= 1ULL << key;
+    rtc_gpio_pullup_en((gpio_num_t)key);
+    rtc_gpio_pulldown_dis((gpio_num_t)key);
+  }
+  esp_sleep_enable_ext1_wakeup(mask, ESP_EXT1_WAKEUP_ANY_LOW);
+  esp_sleep_enable_timer_wakeup(SLEEP_INTERVAL_S * 1000000ULL);
+  Serial.printf("Sleeping for %d s\n", SLEEP_INTERVAL_S);
+  Serial.flush();
+  esp_deep_sleep_start();
+}
+
 void setup() {
   Serial.begin(115200);
   setCpuFrequencyMhz(80);  // the lowest clock Wi-Fi works with
-  for (int key : {KEY_EXIT, KEY_HOME, KEY_DOWN, KEY_OK, KEY_UP}) pinMode(key, INPUT_PULLUP);
+  for (int key : KEYS) pinMode(key, INPUT_PULLUP);
   epd::begin();
   u8g2.begin(canvas);
   u8g2.setFontMode(1);
   u8g2.setForegroundColor(BLACK);
   u8g2.setBackgroundColor(WHITE);
-  logEvent("Start (" + resetReason() + ")");
+  wakeCause = esp_sleep_get_wakeup_cause();
+  bool fromSleep = SLEEP_MODE && (wakeCause == ESP_SLEEP_WAKEUP_TIMER || wakeCause == ESP_SLEEP_WAKEUP_EXT1);
+  logEvent(fromSleep ? "Aufgewacht" : "Start (" + resetReason() + ")");
 
-  // Draw the stored data right away, without waiting for Wi-Fi
+  // Draw the stored data right away, without waiting for Wi-Fi. After deep sleep the panel still
+  // shows it, so only the daily refresh draws then.
   load();
   canvas.setRotation(flipped ? 2 : 0);
-  if (!current.ssid.isEmpty()) render(current);
+  if (fromSleep) {
+    waitingScreenShown = true;
+    if (wakeCause == ESP_SLEEP_WAKEUP_TIMER) secondsSinceRefresh += SLEEP_INTERVAL_S;
+    if (secondsSinceRefresh >= 24UL * 60 * 60 && !current.ssid.isEmpty()) {
+      secondsSinceRefresh = 0;
+      dailyRefresh();
+    }
+  } else {
+    secondsSinceRefresh = 0;
+    if (!current.ssid.isEmpty()) render(current);
+  }
 
   WiFi.persistent(false);
   WiFi.setHostname(HOSTNAME);  // before mode(), otherwise the default name is used
@@ -420,18 +491,27 @@ void setup() {
   mqtt.setKeepAlive(60);
   mqtt.setSocketTimeout(5);
   mqtt.setCallback(onMessage);
+
+  if (SLEEP_MODE && wakeCause == ESP_SLEEP_WAKEUP_EXT1) {
+    // Which key woke the display up (the lowest GPIO if several)
+    uint64_t status = esp_sleep_get_ext1_wakeup_status();
+    for (int key : KEYS) {
+      if (status & (1ULL << key)) {
+        handleKey(key);
+        break;
+      }
+    }
+  }
+  lastActivity = millis();
 }
 
 void loop() {
   static bool wasConnected = false, wasMqttConnected = false;
   static uint32_t lastAttempt = 0, lastMqttAttempt = 0, lastRefresh = 0, lastStatus = 0;
   // Once a day: white, then the image again, so the panel does not burn in
-  if (!current.ssid.isEmpty() && debugPage < 0 && millis() - lastRefresh > 24UL * 60 * 60 * 1000) {
+  if (!SLEEP_MODE && !current.ssid.isEmpty() && debugPage < 0 && millis() - lastRefresh > 24UL * 60 * 60 * 1000) {
     lastRefresh = millis();
-    logEvent("Täglicher Refresh");
-    canvas.fillScreen(WHITE);
-    epd::show(canvas.getBuffer());
-    render(current);
+    dailyRefresh();
   }
 
   if (disconnectReason >= 0) {
@@ -470,10 +550,18 @@ void loop() {
   }
 
   int key = pressedKey();
-  if (key >= 0) handleKey(key);
+  if (key >= 0) {
+    handleKey(key);
+    lastActivity = millis();
+  }
   if (debugPage >= 0 && millis() - debugSince > DEBUG_TIMEOUT) {
     debugPage = -1;
     showCurrent();
+    lastActivity = millis();
+  }
+  if (SLEEP_MODE && debugPage < 0 && (gotMessage || millis() > CYCLE_TIMEOUT) &&
+      millis() - lastActivity > IDLE_BEFORE_SLEEP) {
+    sleepUntilNextCheck();
   }
   delay(10);
 }
