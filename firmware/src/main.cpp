@@ -2,17 +2,21 @@
 //
 // Subscribes to MQTT_TOPIC (retained, published by publish_mqtt.py):
 //   {"ssid": "...", "password": "...", "payload": "WIFI:...", "updated": "..."}
+// Subscribes to MQTT_IMAGE_TOPIC (retained, published by send_image.py): a 400x300 1-bit bitmap,
+// 15000 bytes, MSB first, 1 = white. "clear" or an empty message removes it.
+// HOME switches between the image and the guest Wi-Fi. New data of the other screen is only saved.
 // Publishes its state to MQTT_STATUS_TOPIC (retained, without the password).
 //
 // With SLEEP_INTERVAL_S in secrets.h the display runs on a battery: it wakes up every
 // SLEEP_INTERVAL_S seconds, reads the retained message, redraws if it changed, publishes its status
 // and goes back to deep sleep. Any key wakes it up too; it stays awake while the debug screen is open.
 //
-// The last data is kept in NVS and drawn again after a restart and once a day.
+// The last data is kept in NVS, the image in LittleFS; both are drawn again after a restart and once a day.
 // Rotary switch: turn for the debug screens, press to rotate the image by 180 degrees.
-// EXIT or HOME: back to the guest Wi-Fi.
+// EXIT: back from the debug screens. HOME: back as well, otherwise switch between image and guest Wi-Fi.
 #include <Adafruit_GFX.h>
 #include <ArduinoJson.h>
+#include <LittleFS.h>
 #include <Preferences.h>
 #include <PubSubClient.h>
 #include <U8g2_for_Adafruit_GFX.h>
@@ -31,6 +35,13 @@
 #define SLEEP_INTERVAL_S 0
 #endif
 constexpr bool SLEEP_MODE = SLEEP_INTERVAL_S > 0;
+
+// secrets.h from before images were supported has no MQTT_IMAGE_TOPIC
+#ifndef MQTT_IMAGE_TOPIC
+#define MQTT_IMAGE_TOPIC "guestpass/image"
+#endif
+constexpr size_t IMAGE_SIZE = epd::WIDTH * epd::HEIGHT / 8;
+const char *IMAGE_FILE = "/image.bin";
 
 constexpr uint16_t BLACK = 0;
 constexpr uint16_t WHITE = 1;
@@ -66,6 +77,9 @@ WiFiClient net;
 PubSubClient mqtt(net);
 Preferences prefs;
 GuestWifi current;
+uint8_t image[IMAGE_SIZE];
+bool hasImage = false;
+bool imageView = false;  // the image is the main screen instead of the guest Wi-Fi, kept in NVS
 bool waitingScreenShown = false;
 bool flipped = false;  // image rotated by 180 degrees, kept in NVS
 int debugPage = -1;  // -1: the guest Wi-Fi screen
@@ -203,7 +217,18 @@ bool renderWaiting() {
   return epd::show(canvas.getBuffer());
 }
 
+bool renderImage() {
+  // drawBitmap honours the canvas rotation, so the 180 degree setting applies to the image too
+  canvas.drawBitmap(0, 0, image, epd::WIDTH, epd::HEIGHT, WHITE, BLACK);
+  return epd::show(canvas.getBuffer());
+}
+
+bool showingImage() { return hasImage && (imageView || current.ssid.isEmpty()); }
+
+bool hasContent() { return hasImage || !current.ssid.isEmpty(); }
+
 bool showCurrent() {
+  if (showingImage()) return renderImage();
   return current.ssid.isEmpty() ? renderWaiting() : render(current);
 }
 
@@ -277,6 +302,7 @@ bool renderDebug(int page) {
     line("Letzte Nachricht", lastMessage.uptime ? eventTime(lastMessage) : "noch keine", col);
     line("Gäste-SSID", current.ssid.isEmpty() ? "(keine)" : current.ssid, col);
     line("Stand der Daten", current.updated.isEmpty() ? "-" : current.updated, col);
+    line("Bild", !hasImage ? "keins" : showingImage() ? "wird angezeigt" : "vorhanden, HOME zeigt es", col);
     line("Abbrüche", String(wifiDrops) + " WLAN, " + String(mqttDrops) + " MQTT", col);
   } else {
     for (int i = 0; i < eventCount; i++) line(eventTime(events[i]), events[i].text, 120);
@@ -293,7 +319,14 @@ void load() {
   current = {prefs.getString("ssid"), prefs.getString("password"), prefs.getString("payload"),
              prefs.getString("updated")};
   flipped = prefs.getBool("flipped");
+  imageView = prefs.getBool("imageView");
   prefs.end();
+  hasImage = LittleFS.exists(IMAGE_FILE);
+  if (hasImage) {
+    File f = LittleFS.open(IMAGE_FILE, "r");
+    hasImage = f.read(image, IMAGE_SIZE) == IMAGE_SIZE;
+    f.close();
+  }
 }
 
 void save(const GuestWifi &w) {
@@ -305,12 +338,32 @@ void save(const GuestWifi &w) {
   prefs.end();
 }
 
+void setImageView(bool on) {
+  if (imageView == on) return;
+  imageView = on;
+  prefs.begin("guestwifi", false);
+  prefs.putBool("imageView", on);
+  prefs.end();
+}
+
+void saveImage() {
+  if (!hasImage) {
+    LittleFS.remove(IMAGE_FILE);
+    return;
+  }
+  File f = LittleFS.open(IMAGE_FILE, "w");
+  if (!f || f.write(image, IMAGE_SIZE) != IMAGE_SIZE) logEvent("Bild nicht gespeichert");
+  f.close();
+}
+
 void publishStatus(bool online = true) {
   JsonDocument doc;
   doc["online"] = online;
   if (SLEEP_MODE) doc["sleep_interval"] = SLEEP_INTERVAL_S;
   doc["shown_ssid"] = current.ssid;
   doc["updated"] = current.updated;
+  doc["image"] = hasImage;
+  doc["showing"] = showingImage() ? "image" : "wifi";
   doc["rssi"] = WiFi.RSSI();
   doc["ip"] = WiFi.localIP().toString();
   doc["uptime"] = millis() / 1000;
@@ -322,9 +375,38 @@ void publishStatus(bool online = true) {
   mqtt.publish(MQTT_STATUS_TOPIC, out.c_str(), true);
 }
 
+void onImage(const byte *payload, unsigned int length) {
+  bool wasShowing = showingImage();
+  if (length == 0 || (length == 5 && memcmp(payload, "clear", 5) == 0)) {
+    if (!hasImage) return;
+    hasImage = false;
+    saveImage();
+    setImageView(false);
+    logEvent("Bild gelöscht");
+  } else if (length != IMAGE_SIZE) {
+    logEvent("Bild: " + String(length) + " statt " + String(IMAGE_SIZE) + " Bytes");
+    return;
+  } else if (hasImage && memcmp(image, payload, IMAGE_SIZE) == 0) {
+    logEvent("Bild unverändert");
+    return;
+  } else {
+    memcpy(image, payload, IMAGE_SIZE);
+    hasImage = true;
+    saveImage();
+    logEvent("Neues Bild");
+  }
+  // Redraw only if the image is (or was) on screen, the debug screen draws it when it closes
+  if (debugPage < 0 && (wasShowing || showingImage()) && !showCurrent()) logEvent("Refresh nicht fertig");
+  publishStatus();
+}
+
 void onMessage(char *topic, byte *payload, unsigned int length) {
   gotMessage = true;
   lastMessage = {time(nullptr), max(millis() / 1000, 1UL), ""};
+  if (strcmp(topic, MQTT_IMAGE_TOPIC) == 0) {
+    onImage(payload, length);
+    return;
+  }
   JsonDocument doc;
   if (deserializeJson(doc, payload, length)) {
     logEvent("MQTT: ungültiges JSON");
@@ -347,8 +429,8 @@ void onMessage(char *topic, byte *payload, unsigned int length) {
   save(w);
   current = w;
   logEvent("Neue Daten: " + w.ssid);
-  // The debug screen stays until it is closed, then the new data is drawn
-  if (debugPage < 0 && !render(w)) logEvent("Refresh nicht fertig");
+  // In image view the data is only saved. The debug screen stays until it is closed, then the new data is drawn.
+  if (debugPage < 0 && !showingImage() && !render(w)) logEvent("Refresh nicht fertig");
   publishStatus();
 }
 
@@ -359,7 +441,9 @@ void connectMqtt() {
     return;
   }
   logEvent("MQTT verbunden");
-  mqtt.subscribe(MQTT_TOPIC, 1);  // the retained message arrives right away
+  // The retained messages arrive right away
+  mqtt.subscribe(MQTT_TOPIC, 1);
+  mqtt.subscribe(MQTT_IMAGE_TOPIC, 1);
   publishStatus();
 }
 
@@ -380,8 +464,13 @@ int pressedKey() {
 
 void handleKey(int key) {
   if (key == KEY_EXIT || key == KEY_HOME) {
-    if (debugPage < 0) return;
-    debugPage = -1;
+    if (debugPage >= 0) {
+      debugPage = -1;
+    } else if (key == KEY_HOME && hasImage && !current.ssid.isEmpty()) {
+      setImageView(!showingImage());
+    } else {
+      return;
+    }
     showCurrent();
     return;
   }
@@ -412,7 +501,7 @@ void dailyRefresh() {
   logEvent("Täglicher Refresh");
   canvas.fillScreen(WHITE);
   epd::show(canvas.getBuffer());
-  render(current);
+  showCurrent();
 }
 
 bool anyKeyDown() {
@@ -458,6 +547,8 @@ void setup() {
   bool fromSleep = SLEEP_MODE && (wakeCause == ESP_SLEEP_WAKEUP_TIMER || wakeCause == ESP_SLEEP_WAKEUP_EXT1);
   logEvent(fromSleep ? "Aufgewacht" : "Start (" + resetReason() + ")");
 
+  if (!LittleFS.begin(true)) logEvent("LittleFS fehlt");  // formats the partition on first use
+
   // Draw the stored data right away, without waiting for Wi-Fi. After deep sleep the panel still
   // shows it, so only the daily refresh draws then.
   load();
@@ -465,13 +556,13 @@ void setup() {
   if (fromSleep) {
     waitingScreenShown = true;
     if (wakeCause == ESP_SLEEP_WAKEUP_TIMER) secondsSinceRefresh += SLEEP_INTERVAL_S;
-    if (secondsSinceRefresh >= 24UL * 60 * 60 && !current.ssid.isEmpty()) {
+    if (secondsSinceRefresh >= 24UL * 60 * 60 && hasContent()) {
       secondsSinceRefresh = 0;
       dailyRefresh();
     }
   } else {
     secondsSinceRefresh = 0;
-    if (!current.ssid.isEmpty()) render(current);
+    if (hasContent()) showCurrent();
   }
 
   WiFi.persistent(false);
@@ -487,7 +578,7 @@ void setup() {
   configTzTime("CET-1CEST,M3.5.0,M10.5.0/3", "fritz.box", "pool.ntp.org");
 
   mqtt.setServer(MQTT_HOST, MQTT_PORT);
-  mqtt.setBufferSize(512);  // the default of 256 bytes is too small for the JSON
+  mqtt.setBufferSize(IMAGE_SIZE + 256);  // the image plus topic and header
   mqtt.setKeepAlive(60);
   mqtt.setSocketTimeout(5);
   mqtt.setCallback(onMessage);
@@ -509,7 +600,7 @@ void loop() {
   static bool wasConnected = false, wasMqttConnected = false;
   static uint32_t lastAttempt = 0, lastMqttAttempt = 0, lastRefresh = 0, lastStatus = 0;
   // Once a day: white, then the image again, so the panel does not burn in
-  if (!SLEEP_MODE && !current.ssid.isEmpty() && debugPage < 0 && millis() - lastRefresh > 24UL * 60 * 60 * 1000) {
+  if (!SLEEP_MODE && hasContent() && debugPage < 0 && millis() - lastRefresh > 24UL * 60 * 60 * 1000) {
     lastRefresh = millis();
     dailyRefresh();
   }
@@ -521,7 +612,7 @@ void loop() {
   bool connected = WiFi.status() == WL_CONNECTED;
   if (connected && !wasConnected) {
     logEvent("WLAN verbunden, " + WiFi.localIP().toString());
-    if (current.ssid.isEmpty() && !waitingScreenShown && debugPage < 0) waitingScreenShown = renderWaiting();
+    if (!hasContent() && !waitingScreenShown && debugPage < 0) waitingScreenShown = renderWaiting();
   }
   if (!connected && wasConnected) wifiDrops++;
   // Auto-reconnect does not retry when the first connection fails, so start over now and then

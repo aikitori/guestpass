@@ -17,7 +17,8 @@ display ──publish (retained)──▶ guestpass/display/status   (no passwor
 | Topic | Direction | Content |
 |---|---|---|
 | `guestpass/wifi` | host → display, retained | `{"ssid", "password", "payload", "updated"}` |
-| `guestpass/display/status` | display → broker, retained | `{"online", "shown_ssid", "updated", "rssi", "ip", "uptime", "wifi_drops", "mqtt_drops", "firmware"}`, last will `{"online": false}` |
+| `guestpass/image` | host → display, retained | 400×300 1-bit bitmap (15000 bytes, MSB first, 1 = white) from `send_image.py`; `clear` removes it |
+| `guestpass/display/status` | display → broker, retained | `{"online", "shown_ssid", "updated", "image", "showing", "rssi", "ip", "uptime", "wifi_drops", "mqtt_drops", "firmware"}`, last will `{"online": false}` |
 
 The broker should restrict access: the host may only write `guestpass/wifi`,
 the display may read `guestpass/wifi` and write `guestpass/display/#`.
@@ -40,8 +41,8 @@ Pins from Elecrow's documentation, all active low with internal pull-ups:
 | Rotary switch up | 6 | open the debug screen, previous page |
 | Rotary switch down | 4 | open the debug screen, next page |
 | Rotary switch press | 5 | rotate the image by 180° (kept in NVS) |
-| EXIT | 1 | back to the guest Wi-Fi screen |
-| HOME | 2 | back to the guest Wi-Fi screen |
+| EXIT | 1 | close the debug screen |
+| HOME | 2 | close the debug screen, otherwise switch between image and guest Wi-Fi (kept in NVS) |
 
 The debug screen closes by itself after 2 minutes without input.
 While it is open, new data is saved but drawn only after it closes.
@@ -80,3 +81,5 @@ in RTC memory, OTA maintenance mode.
       image, keys and rotation, debug timeout
 - [x] README section "E-paper display"
 - [x] Deep sleep option (Phase 2), build checked; sleep current not measured yet
+- [x] Images: `send_image.py`, `guestpass/image`, stored in LittleFS, HOME switches the view;
+      new data for the hidden view is only saved. Build checked, not tested on the board yet
