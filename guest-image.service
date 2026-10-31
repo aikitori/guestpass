@@ -1,0 +1,12 @@
+[Unit]
+Description=Send a random image to the guest Wi-Fi e-paper display
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+# Default folder, can be overridden with IMAGE_DIR in guest-wifi.env
+Environment=IMAGE_DIR=%h/guestpass-images
+EnvironmentFile=%E/guest-wifi.env
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/.local/bin/send_image.py ${IMAGE_DIR}

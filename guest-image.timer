@@ -1,0 +1,13 @@
+[Unit]
+Description=Send a random image to the e-paper display
+
+# Change the interval with: systemctl --user edit guest-image.timer
+#   [Timer]
+#   OnCalendar=
+#   OnCalendar=*-*-* 08,18:00
+[Timer]
+OnCalendar=hourly
+Persistent=true
+
+[Install]
+WantedBy=timers.target
