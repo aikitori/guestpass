@@ -71,7 +71,7 @@ If it fails, `journalctl --user -u guest-wifi.service` shows the error.
 After changing the scripts or the units, install them again and reload systemd:
 
 ```sh
-install -Dm 755 -t ~/.local/bin/ guest_wifi.py publish_mqtt.py
+install -Dm 755 -t ~/.local/bin/ guest_wifi.py publish_mqtt.py send_image.py
 install -Dm 644 -t ~/.config/systemd/user/ guest-wifi.service guest-wifi.timer
 systemctl --user daemon-reload
 ```
@@ -80,7 +80,7 @@ systemctl --user daemon-reload
 
 ```sh
 systemctl --user disable --now guest-wifi.timer
-rm ~/.local/bin/{guest_wifi,publish_mqtt}.py ~/.config/systemd/user/guest-wifi.{service,timer}
+rm ~/.local/bin/{guest_wifi,publish_mqtt,send_image}.py ~/.config/systemd/user/guest-wifi.{service,timer}
 rm -r ~/.config/guest-wifi.env ~/.local/state/guest-wifi
 systemctl --user daemon-reload
 loginctl disable-linger "$USER"   # only if no other user services need it
@@ -108,7 +108,8 @@ cd firmware && pio run -t upload && pio device monitor
 
 The serial monitor shows the connection state. Until it gets data, the display says so.
 Rotary switch: turn for the debug screens (status, event log), press to rotate the image by 180°.
-EXIT or HOME: back to the guest Wi-Fi. The display also publishes its state (without the password)
+EXIT: back from the debug screens. HOME: switch between the guest Wi-Fi and an image (see below).
+The display also publishes its state (without the password)
 to `guestpass/display/status`.
 
 ### Publish the data
@@ -131,7 +132,24 @@ set -a; . ~/.config/guest-wifi.env; set +a
 ```
 
 The password is stored on the broker, so give it a login and an ACL: only the publisher may write
-`guestpass/wifi`, only the display may read it and write `guestpass/display/#`. There is no TLS yet.
+`guestpass/wifi` and `guestpass/image`, only the display may read them and write `guestpass/display/#`.
+There is no TLS yet.
+
+### Send an image
+
+`send_image.py` scales any image (PNG, JPEG, ...) to 400×300, dithers it to black and white and publishes it
+as a retained message to `guestpass/image`. The display keeps it in flash.
+
+```sh
+set -a; . ~/.config/guest-wifi.env; set +a
+./send_image.py photo.jpg                    # fit with white borders
+./send_image.py logo.png --cover --no-dither # fill and crop, hard threshold for text and line art
+./send_image.py photo.jpg --preview out.png  # only write the result, send nothing
+./send_image.py --clear                      # remove the image
+```
+
+HOME switches between the image and the guest Wi-Fi. New data for the screen that is not shown is
+only saved: in guest Wi-Fi view a new image waits for HOME, in image view a new password does too.
 
 ### Battery operation
 
