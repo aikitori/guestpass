@@ -6,6 +6,7 @@
 """Sends an image to the e-paper display (firmware/) via MQTT.
 
 Usage:     MQTT_HOST=... MQTT_USER=... MQTT_PASSWORD=... ./send_image.py IMAGE
+           ./send_image.py FOLDER           a random image from the folder, not the same as last time
            ./send_image.py --clear          back to the guest Wi-Fi screen, image removed
            ./send_image.py IMAGE --preview out.png   only write the 1-bit result, send nothing
 Optional:  MQTT_PORT          (default: 1883)
@@ -20,13 +21,29 @@ appears right away, in guest Wi-Fi view it is only saved.
 """
 import argparse
 import os
+import random
 import sys
+from pathlib import Path
 
 import paho.mqtt.publish as publish
 from PIL import Image, ImageOps
 
 SIZE = (400, 300)
 DEFAULT_TOPIC = "guestpass/image"
+EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"}
+LAST_FILE = Path(os.environ.get("XDG_STATE_HOME", "~/.local/state")).expanduser() / "guest-wifi" / "last-image"
+
+
+def pick_random(folder):
+    """Returns a random image from folder, if possible not the one picked last time."""
+    images = sorted(f for f in Path(folder).expanduser().iterdir() if f.suffix.lower() in EXTENSIONS)
+    if not images:
+        raise SystemExit(f"No images in {folder}.")
+    last = LAST_FILE.read_text().strip() if LAST_FILE.exists() else None
+    choice = random.choice([f for f in images if f.name != last] or images)
+    LAST_FILE.parent.mkdir(parents=True, exist_ok=True)
+    LAST_FILE.write_text(choice.name)
+    return choice
 
 
 def to_bitmap(path, cover=False, dither=True):
@@ -55,7 +72,9 @@ def main():
     if a.clear:
         payload = b"clear"
     else:
-        bitmap = to_bitmap(a.image, a.cover, not a.no_dither)
+        path = pick_random(a.image) if Path(a.image).expanduser().is_dir() else a.image
+        print(f"Image: {path}")
+        bitmap = to_bitmap(path, a.cover, not a.no_dither)
         if a.preview:
             bitmap.save(a.preview)
             print(f"Preview written to {a.preview}")

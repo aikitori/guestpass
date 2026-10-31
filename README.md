@@ -72,15 +72,15 @@ After changing the scripts or the units, install them again and reload systemd:
 
 ```sh
 install -Dm 755 -t ~/.local/bin/ guest_wifi.py publish_mqtt.py send_image.py
-install -Dm 644 -t ~/.config/systemd/user/ guest-wifi.service guest-wifi.timer
+install -Dm 644 -t ~/.config/systemd/user/ guest-wifi.service guest-wifi.timer guest-image.service guest-image.timer
 systemctl --user daemon-reload
 ```
 
 ### Uninstall
 
 ```sh
-systemctl --user disable --now guest-wifi.timer
-rm ~/.local/bin/{guest_wifi,publish_mqtt,send_image}.py ~/.config/systemd/user/guest-wifi.{service,timer}
+systemctl --user disable --now guest-wifi.timer guest-image.timer
+rm ~/.local/bin/{guest_wifi,publish_mqtt,send_image}.py ~/.config/systemd/user/guest-{wifi,image}.{service,timer}
 rm -r ~/.config/guest-wifi.env ~/.local/state/guest-wifi
 systemctl --user daemon-reload
 loginctl disable-linger "$USER"   # only if no other user services need it
@@ -145,11 +145,35 @@ set -a; . ~/.config/guest-wifi.env; set +a
 ./send_image.py photo.jpg                    # fit with white borders
 ./send_image.py logo.png --cover --no-dither # fill and crop, hard threshold for text and line art
 ./send_image.py photo.jpg --preview out.png  # only write the result, send nothing
+./send_image.py ~/guestpass-images           # a random image from the folder, not the same as last time
 ./send_image.py --clear                      # remove the image
 ```
 
 HOME switches between the image and the guest Wi-Fi. New data for the screen that is not shown is
 only saved: in guest Wi-Fi view a new image waits for HOME, in image view a new password does too.
+
+#### A random image on a timer
+
+`guest-image.timer` sends a random image from `~/guestpass-images` every hour
+(another folder: `IMAGE_DIR=...` in `~/.config/guest-wifi.env`):
+
+```sh
+mkdir -p ~/guestpass-images                  # put your images here
+install -Dm 755 send_image.py ~/.local/bin/send_image.py
+install -Dm 644 -t ~/.config/systemd/user/ guest-image.service guest-image.timer
+systemctl --user daemon-reload
+systemctl --user enable --now guest-image.timer
+```
+
+To change the interval, run `systemctl --user edit guest-image.timer` and add, for example:
+
+```ini
+[Timer]
+OnCalendar=
+OnCalendar=*-*-* 08,18:00
+```
+
+`systemctl --user start guest-image.service` sends one right away.
 
 ### Battery operation
 
